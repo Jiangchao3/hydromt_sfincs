@@ -345,12 +345,12 @@ class SfincsModel(GridModel):
             )
 
             # check if no nan data is present in the bed levels
-            if np.isnan(da_dep).any():
-                self.logger.warning(
-                    f"Interpolate data at {int(np.sum(np.isnan(da_dep.values)))} cells"
+            nmissing = int(np.sum(np.isnan(da_dep.values)))
+            if nmissing > 0:
+                self.logger.warning(f"Interpolate elevation at {nmissing} cells")
+                da_dep = da_dep.raster.interpolate_na(
+                    method="rio_idw", extrapolate=True
                 )
-                # TODO add extrapolate=True option when available in hydromt core
-                da_dep = da_dep.raster.interpolate_na(method="rio_idw")
 
             self.set_grid(da_dep, name="dep")
             # FIXME this shouldn't be necessary, since da_dep should already have a crs
@@ -1110,8 +1110,8 @@ class SfincsModel(GridModel):
         self.config.pop("qinf", None)
         self.set_config(f"{mname}file", f"sfincs.{mname}")
 
-    # Function to create curve number for SFINCS including recovery term (Kr)
-    def setup_cn_infiltration_with_kr(
+    # Function to create curve number for SFINCS including recovery via saturated hydraulic conductivity [mm/hr]
+    def setup_cn_infiltration_with_ks(
         self, lulc, hsg, ksat, reclass_table, effective, block_size=2000
     ):
         """Setup model the Soil Conservation Service (SCS) Curve Number (CN) files for SFINCS
@@ -1124,7 +1124,7 @@ class SfincsModel(GridModel):
         hsg : str, Path, or RasterDataset
             HSG (Hydrological Similarity Group) in integers
         ksat : str, Path, or RasterDataset
-            Ksat (saturated hydraulic conductivity) [µm/s]
+            Ksat (saturated hydraulic conductivity) [mm/hr]
         reclass_table : str, Path, or RasterDataset
             reclass table to relate landcover with soiltype
         effective : float
@@ -1147,7 +1147,7 @@ class SfincsModel(GridModel):
 
         # Define outputs
         da_smax = xr.full_like(self.mask, -9999, dtype=np.float32)
-        da_kr = xr.full_like(self.mask, -9999, dtype=np.float32)
+        da_ks = xr.full_like(self.mask, -9999, dtype=np.float32)
 
         # Compute resolution land use (we are assuming that is the finest)
         resolution_landuse = np.mean(
@@ -1207,7 +1207,7 @@ class SfincsModel(GridModel):
                 # Call workflow
                 (
                     da_smax_block,
-                    da_kr_block,
+                    da_ks_block,
                 ) = workflows.curvenumber.scs_recovery_determination(
                     da_landuse, da_HSG, da_Ksat, df_map, da_mask_block
                 )
@@ -1215,7 +1215,7 @@ class SfincsModel(GridModel):
                 # New place in the overall matrix
                 sn, sm = slice(bn0, bn1), slice(bm0, bm1)
                 da_smax[sn, sm] = da_smax_block
-                da_kr[sn, sm] = da_kr_block
+                da_ks[sn, sm] = da_ks_block
 
         # Done
         self.logger.info(f"Done with determination of values (in blocks).")
@@ -1225,9 +1225,9 @@ class SfincsModel(GridModel):
         da_seff = da_seff * effective
         da_seff.raster.set_nodata(da_smax.raster.nodata)
 
-        # set grids for seff, smax and kr
-        names = ["smax", "seff", "kr"]
-        data = [da_smax, da_seff, da_kr]
+        # set grids for seff, smax and ks (saturated hydraulic conductivity)
+        names = ["smax", "seff", "ks"]
+        data = [da_smax, da_seff, da_ks]
         for name, da in zip(names, data):
             # Give metadata to the layer and set grid
             da.attrs.update(**self._ATTRS.get(name, {}))
@@ -2416,7 +2416,7 @@ class SfincsModel(GridModel):
             )
 
     # Plotting
-    def plot_forcing(self, fn_out=None, **kwargs):
+    def plot_forcing(self, fn_out=None, forcings="all", **kwargs):
         """Plot model timeseries forcing.
 
         For distributed forcing a spatial avarage, minimum or maximum is plotted.
@@ -2427,8 +2427,14 @@ class SfincsModel(GridModel):
             Path to output figure file.
             If a basename is given it is saved to <model_root>/figs/<fn_out>
             If None, no file is saved.
-        forcing : Dict of xr.DataArray
-            Model forcing
+        forcings : str
+            List of forcings to plot, by default 'all'.
+            If 'all', all available forcings are plotted.
+            See :py:attr:`~hydromt_sfincs.SfincsModel.forcing.keys()`
+            for available forcings.
+        **kwargs : dict
+            Additional keyword arguments passed to
+            :py:func:`hydromt.plotting.plot_forcing`.
 
         Returns
         -------
@@ -2440,10 +2446,21 @@ class SfincsModel(GridModel):
 
         if self.forcing:
             forcing = {}
-            for name in self.forcing:
+            if forcings == "all":
+                forcings = list(self.forcing.keys())
+            elif isinstance(forcings, str):
+                forcings = [forcings]
+            for name in forcings:
+                if name not in self.forcing:
+                    self.logger.warning(f'No forcing named "{name}" found in model.')
+                    continue
                 if isinstance(self.forcing[name], xr.Dataset):
-                    continue  # plot only dataarrays
-                forcing[name] = self.forcing[name]
+                    self.logger.warning(
+                        f'Skipping forcing "{name}" as it is a dataset.'
+                    )
+                    continue
+                # plot only dataarrays
+                forcing[name] = self.forcing[name].copy()
                 # update missing attributes for plot labels
                 forcing[name].attrs.update(**self._ATTRS.get(name, {}))
             if len(forcing) > 0:
@@ -2524,7 +2541,7 @@ class SfincsModel(GridModel):
         for fname, gname in self._FORCING_1D.values():
             if fname[0] in self.forcing and gname is not None:
                 try:
-                    sg.update({gname: self._forcing[fname[0]].vector.to_gdf()})
+                    sg.update({gname: self.forcing[fname[0]].vector.to_gdf()})
                 except ValueError:
                     self.logger.debug(f'unable to plot forcing location: "{fname}"')
         if plot_region and "region" not in self.geoms:
@@ -2993,12 +3010,17 @@ class SfincsModel(GridModel):
         self._assert_read_mode
 
         # read index file
-        ind_fn = self.get_config("indexfile", fallback="sfincs.ind", abs_path=True)
-        if not isfile(ind_fn):
-            raise IOError(f".ind path {ind_fn} does not exist")
-
+        # TODO make reggrid a property where we trigger the initialization of reggrid
+        if self.reggrid is None:
+            self.update_grid_from_config()
         if self.reggrid is not None:
-            ind = self.reggrid.read_ind(ind_fn=ind_fn)
+            ind_fn = self.get_config("indexfile", fallback="sfincs.ind", abs_path=True)
+            if "msk" in self.grid:  # triggers reading grid if empty and in read mode
+                ind = self.reggrid.ind(self.grid["msk"].values)
+            elif isfile(ind_fn):
+                ind = self.reggrid.read_ind(ind_fn=ind_fn)
+            else:
+                raise IOError(f"indexfile {ind_fn} does not exist")
             if "inifile" in self.config:
                 fn = self.get_config("inifile", abs_path=True)
                 if not isfile(fn):
@@ -3036,8 +3058,8 @@ class SfincsModel(GridModel):
             ind_fn = self.get_config("indexfile", abs_path=True)
             self.reggrid.write_ind(ind_fn=ind_fn, mask=mask)
 
-            if f"inifile" not in self.config:
-                self.set_config(f"inifile", f"sfincs.{name}")
+            if "inifile" not in self.config:
+                self.set_config("inifile", f"sfincs.{name}")
             fn = self.get_config("inifile", abs_path=True)
             da = self.states[name]
             if da.raster.res[1] < 0:
@@ -3098,7 +3120,7 @@ class SfincsModel(GridModel):
                 fn_his, crs=self.crs, chunksize=chunksize
             )
             # drop double vars (map files has priority)
-            drop_vars = [v for v in ds_his.data_vars if v in self._results or v in drop]
+            drop_vars = [v for v in ds_his.data_vars if v in self.results or v in drop]
             ds_his = ds_his.drop_vars(drop_vars)
             self.set_results(ds_his, split_dataset=True)
 
@@ -3165,7 +3187,7 @@ class SfincsModel(GridModel):
                         )
                         continue
                 # only write active cells to gis files
-                da = da.raster.clip_geom(self.region, mask=True).raster.mask_nodata()
+                da = da.where(self.mask > 0, da.raster.nodata).raster.mask_nodata()
                 if da.raster.res[1] > 0:  # make sure orientation is N->S
                     da = da.raster.flipud()
                 da.raster.to_raster(
@@ -3336,7 +3358,7 @@ class SfincsModel(GridModel):
             level of the depth datasets.
         """
         parse_keys = ["elevtn", "offset", "mask", "da"]
-        copy_keys = ["zmin", "zmax", "reproj_method", "merge_method"]
+        copy_keys = ["zmin", "zmax", "reproj_method", "merge_method", "offset"]
 
         datasets_out = []
         for dataset in datasets_dep:
