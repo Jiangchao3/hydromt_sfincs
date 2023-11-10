@@ -16,11 +16,10 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from hydromt.models.model_grid import GridModel
-from hydromt.raster import RasterDataArray
 from hydromt.vector import GeoDataArray, GeoDataset
 from hydromt.workflows.forcing import da_to_timedelta
 from pyproj import CRS
-from shapely.geometry import box, LineString, MultiLineString, Polygon
+from shapely.geometry import LineString, box
 
 from . import DATADIR, plots, utils, workflows
 from .regulargrid import RegularGrid
@@ -65,7 +64,7 @@ class SfincsModel(GridModel):
         ),
     }
     _FORCING_SPW = {"spiderweb": "spw"}  # TODO add read and write functions
-    _MAPS = ["msk", "dep", "scs", "manning", "qinf", "smax", "seff", "kr"]
+    _MAPS = ["msk", "dep", "scs", "manning", "qinf", "smax", "seff", "ks", "vol"]
     _STATES = ["rst", "ini"]
     _FOLDERS = []
     _CLI_ARGS = {"region": "setup_grid_from_region", "res": "setup_grid_from_region"}
@@ -80,6 +79,7 @@ class SfincsModel(GridModel):
         },
         "qinf": {"standard_name": "infiltration rate", "unit": "mm.hr-1"},
         "manning": {"standard_name": "manning roughness", "unit": "s.m-1/3"},
+        "vol": {"standard_name": "storage volume", "unit": "m3"},
         "bzs": {"standard_name": "waterlevel", "unit": "m+ref"},
         "bzi": {"standard_name": "wave height", "unit": "m"},
         "dis": {"standard_name": "discharge", "unit": "m3.s-1"},
@@ -225,6 +225,7 @@ class SfincsModel(GridModel):
         rotated: bool = False,
         hydrography_fn: str = None,
         basin_index_fn: str = None,
+        align: bool = False,
         dec_origin: int = 0,
         dec_rotation: int = 3,
     ):
@@ -256,6 +257,9 @@ class SfincsModel(GridModel):
             Name of data source with basin (bounding box) geometries associated with
             the 'basins' layer of `hydrography_fn`. Only required if the `region` is
             based on a (sub)(inter)basins without a 'bounds' argument.
+        align : bool, optional
+            If True (default), align target transform to resolution.
+            Note that this has only been implemented for non-rotated grids.
         dec_origin : int, optional
             number of decimals to round the origin coordinates, by default 0
         dec_rotation : int, optional
@@ -278,6 +282,10 @@ class SfincsModel(GridModel):
         if self.geoms["region"].crs != pyproj_crs:
             self.geoms["region"] = self.geoms["region"].to_crs(pyproj_crs)
 
+        # update config for geographic coordinates
+        if pyproj_crs.is_geographic:
+            self.set_config("crsgeo", 1)
+
         # create grid from region
         # NOTE keyword rotated is added to still have the possibility to create unrotated grids if needed (e.g. for FEWS?)
         if rotated:
@@ -287,7 +295,11 @@ class SfincsModel(GridModel):
             )
         else:
             x0, y0, x1, y1 = self.geoms["region"].total_bounds
-            x0, y0 = round(x0, dec_origin), round(y0, dec_origin)
+            if align:
+                x0 = round(x0 / res) * res
+                y0 = round(y0 / res) * res
+            else:
+                x0, y0 = round(x0, dec_origin), round(y0, dec_origin)
             mmax = int(np.ceil((x1 - x0) / res))
             nmax = int(np.ceil((y1 - y0) / res))
             rot = 0
@@ -601,7 +613,6 @@ class SfincsModel(GridModel):
         manning_land: float = 0.04,
         manning_sea: float = 0.02,
         rgh_lev_land: float = 0.0,
-        extrapolate_values: bool = False,
         write_dep_tif: bool = False,
         write_man_tif: bool = False,
     ):
@@ -723,7 +734,6 @@ class SfincsModel(GridModel):
                 rgh_lev_land=rgh_lev_land,
                 write_dep_tif=write_dep_tif,
                 write_man_tif=write_man_tif,
-                extrapolate_values=extrapolate_values,
                 highres_dir=highres_dir,
                 logger=self.logger,
             )
@@ -751,6 +761,7 @@ class SfincsModel(GridModel):
         merge: bool = False,
         first_index: int = 1,
         keep_rivers_geom: bool = False,
+        reverse_river_geom: bool = False,
     ):
         """Setup discharge (src) points where a river enters the model domain.
 
@@ -794,8 +805,9 @@ class SfincsModel(GridModel):
             First index for the river source points, by default 1.
         keep_rivers_geom: bool, optional
             If True, keep a geometry of the rivers "rivers_inflow" in geoms. By default False.
-        buffer: int, optional
-            Buffer [no. of cells] around model domain, by default 10.
+        reverse_river_geom: bool, optional
+            If True, assume that segments in 'rivers' are drawn from downstream to upstream.
+            Only used if 'rivers' is not None, By default False
 
         See Also
         --------
@@ -812,7 +824,11 @@ class SfincsModel(GridModel):
             )
             da_flwdir = ds["flwdir"]
             da_uparea = ds["uparea"]
-        elif rivers == "rivers_outflow" and rivers in self.geoms:
+        elif (
+            isinstance(rivers, str)
+            and rivers == "rivers_outflow"
+            and rivers in self.geoms
+        ):
             # reuse rivers from setup_river_in/outflow
             gdf_riv = self.geoms[rivers]
         elif rivers is not None:
@@ -831,6 +847,8 @@ class SfincsModel(GridModel):
             river_len=river_len,
             river_upa=river_upa,
             inflow=True,
+            reverse_river_geom=reverse_river_geom,
+            logger=self.logger,
         )
         n = len(gdf_src.index)
         self.logger.info(f"Found {n} river inflow points.")
@@ -873,6 +891,7 @@ class SfincsModel(GridModel):
         keep_rivers_geom: bool = False,
         reset_bounds: bool = False,
         btype: str = "outflow",
+        reverse_river_geom: bool = False,
     ):
         """Setup open boundary cells (mask=3) where a river flows
         out of the model domain.
@@ -916,6 +935,9 @@ class SfincsModel(GridModel):
             by default False.
         btype: {'waterlevel', 'outflow'}
             Boundary type
+        reverse_river_geom: bool, optional
+            If True, assume that segments in 'rivers' are drawn from downstream to upstream.
+            Only used if rivers is not None, By default False
 
         See Also
         --------
@@ -931,7 +953,11 @@ class SfincsModel(GridModel):
             )
             da_flwdir = ds["flwdir"]
             da_uparea = ds["uparea"]
-        elif rivers == "rivers_inflow" and rivers in self.geoms:
+        elif (
+            isinstance(rivers, str)
+            and rivers == "rivers_inflow"
+            and rivers in self.geoms
+        ):
             # reuse rivers from setup_river_in/outflow
             gdf_riv = self.geoms[rivers]
         elif rivers is not None:
@@ -951,6 +977,8 @@ class SfincsModel(GridModel):
             river_len=river_len,
             river_upa=river_upa,
             inflow=False,
+            reverse_river_geom=reverse_river_geom,
+            logger=self.logger,
         )
 
         if len(gdf_out) > 0:
@@ -1572,6 +1600,62 @@ class SfincsModel(GridModel):
         self.set_geoms(gdf_structures, "drn")
         self.set_config("drnfile", f"sfincs.drn")
 
+    def setup_storage_volume(
+        self,
+        storage_locs: Union[str, Path, gpd.GeoDataFrame],
+        volume: Union[float, List[float]] = None,
+        height: Union[float, List[float]] = None,
+        merge: bool = True,
+    ):
+        """Setup storage volume.
+
+        Adds model layer:
+        * **vol** map: storage volume for green infrastructure
+
+        Parameters
+        ----------
+        storage_locs : str, Path
+            Path, data source name, or geopandas object to storage location polygon or point geometry file.
+            Optional "volume" or "height" attributes can be provided to set the storage volume.
+        volume : float, optional
+            Storage volume [m3], by default None
+        height : float, optional
+            Storage height [m], by default None
+        merge : bool, optional
+            If True, merge with existing storage volumes, by default True.
+
+        """
+
+        # read, clip and reproject
+        gdf = self.data_catalog.get_geodataframe(
+            storage_locs,
+            geom=self.region,
+            buffer=10,
+        ).to_crs(self.crs)
+
+        if self.grid_type == "regular":
+            # if merge, add new storage volumes to existing ones
+            if merge and "vol" in self.grid:
+                da_vol = self.grid["vol"]
+            else:
+                da_vol = xr.full_like(self.mask, 0, dtype=np.float64)
+
+            # add storage volumes form gdf to da_vol
+            da_vol = workflows.add_storage_volume(
+                da_vol,
+                gdf,
+                volume=volume,
+                height=height,
+                logger=self.logger,
+            )
+
+            # set grid
+            mname = "vol"
+            da_vol.attrs.update(**self._ATTRS.get(mname, {}))
+            self.set_grid(da_vol, name=mname)
+            # update config
+            self.set_config(f"{mname}file", f"sfincs.{mname[:3]}")
+
     ### FORCING
     def set_forcing_1d(
         self,
@@ -1824,6 +1908,10 @@ class SfincsModel(GridModel):
         # get waterlevel boundary vector based on mask
         gdf_msk = utils.get_bounds_vector(self.mask)
         gdf_msk2 = gdf_msk[gdf_msk["value"] == 2]
+
+        # convert to meters if crs is geographic
+        if self.mask.raster.crs.is_geographic:
+            distance = distance / 111111.0
 
         # create points along boundary
         points = []
@@ -2483,13 +2571,13 @@ class SfincsModel(GridModel):
     def plot_basemap(
         self,
         fn_out: str = None,
-        variable: str = "dep",
+        variable: Union[str, xr.DataArray] = "dep",
         shaded: bool = False,
         plot_bounds: bool = True,
         plot_region: bool = False,
         plot_geoms: bool = True,
         bmap: str = None,
-        zoomlevel: int = 11,
+        zoomlevel: int = "auto",
         figsize: Tuple[int] = None,
         geom_names: List[str] = None,
         geom_kwargs: Dict = {},
@@ -2504,8 +2592,9 @@ class SfincsModel(GridModel):
             Path to output figure file, by default None.
             If a basename is given it is saved to <model_root>/figs/<fn_out>
             If None, no file is saved.
-        variable : str, optional
+        variable : str, xr.DataArray, optional
             Map of variable in ds to plot, by default 'dep'
+            Alternatively, provide a xr.DataArray
         shaded : bool, optional
             Add shade to variable (only for variable = 'dep' and non-rotated grids),
             by default False
@@ -2515,10 +2604,12 @@ class SfincsModel(GridModel):
             If True, plot region outline.
         plot_geoms : bool, optional
             If True, plot available geoms.
-        bmap : {'sat', 'osm'}, optional
-            background map, by default None
+        bmap : str, optional
+            background map souce name, by default None.
+            Default image tiles "sat", and "osm" are fetched from cartopy image tiles.
+            If contextily is installed, xyzproviders tiles can be used as well.
         zoomlevel : int, optional
-            zoomlevel, by default 11
+            zoomlevel, by default 'auto'
         figsize : Tuple[int], optional
             figure size, by default None
         geom_names : List[str], optional
@@ -2548,13 +2639,16 @@ class SfincsModel(GridModel):
             sg.update({"region": self.region})
 
         # make sure grid are set
-        if variable.startswith("subgrid.") and self.subgrid:
+        if isinstance(variable, xr.DataArray):
+            ds = variable.to_dataset()
+            variable = variable.name
+        elif variable.startswith("subgrid.") and self.subgrid is not None:
             ds = self.subgrid.copy()
             variable = variable.replace("subgrid.", "")
         else:
             ds = self.grid.copy()
-        if "msk" not in ds:
-            ds["msk"] = self.mask
+            if "msk" not in ds:
+                ds["msk"] = self.mask
 
         fig, ax = plots.plot_basemap(
             ds,
@@ -2790,6 +2884,12 @@ class SfincsModel(GridModel):
         """
         self._assert_write_mode
 
+        # change precision of coordinates according to crs
+        if self.crs.is_geographic:
+            fmt = "%.6f"
+        else:
+            fmt = "%.1f"
+
         if self.geoms:
             dvars = self._GEOMS.values()
             if data_vars is not None:
@@ -2802,13 +2902,13 @@ class SfincsModel(GridModel):
                     fn = self.get_config(f"{gname}file", abs_path=True)
                     if gname in ["thd", "weir", "crs"]:
                         struct = utils.gdf2linestring(gdf)
-                        utils.write_geoms(fn, struct, stype=gname)
+                        utils.write_geoms(fn, struct, stype=gname, fmt=fmt)
                     elif gname == "obs":
-                        utils.write_xyn(fn, gdf, crs=self.crs)
+                        utils.write_xyn(fn, gdf, fmt=fmt)
                     elif gname == "drn":
-                        utils.write_drn(fn, gdf)
+                        utils.write_drn(fn, gdf, fmt=fmt)
                     else:
-                        utils.write_xy(fn, gdf, fmt="%8.2f")
+                        hydromt.io.write_xy(fn, gdf, fmt="%8.2f")
 
             # NOTE: all geoms are written to geojson files in a "gis" subfolder
             if self._write_gis:
@@ -2917,6 +3017,12 @@ class SfincsModel(GridModel):
         """
         self._assert_write_mode
 
+        # change precision of coordinates according to crs
+        if self.crs.is_geographic:
+            fmt = "%.6f"
+        else:
+            fmt = "%.1f"
+
         if self.forcing:
             self.logger.info("Write forcing files")
 
@@ -2966,9 +3072,9 @@ class SfincsModel(GridModel):
                         self.set_config(f"{xy_name}file", f"sfincs.{xy_name}")
                     fn_xy = self.get_config(f"{xy_name}file", abs_path=True)
                     # write xy
-                    utils.write_xy(fn_xy, gdf, fmt="%8.2f")
-                    # write geojson file to gis folder
-                    self.write_vector(variables=f"forcing.{ts_names[0]}")
+                    hydromt.io.write_xy(fn_xy, gdf, fmt=fmt)
+                    if self._write_gis:  # write geojson file to gis folder
+                        self.write_vector(variables=f"forcing.{ts_names[0]}")
 
             # netcdf forcing
             encoding = dict(
@@ -2996,8 +3102,8 @@ class SfincsModel(GridModel):
                 # write 1D timeseries
                 if fname in ["netbndbzsbzi", "netsrcdis"]:
                     ds.vector.to_xy().to_netcdf(fn, encoding=encoding)
-                    # write geojson file to gis folder
-                    self.write_vector(variables=f"forcing.{list(rename.keys())[0]}")
+                    if self._write_gis:  # write geojson file to gis folder
+                        self.write_vector(variables=f"forcing.{list(rename.keys())[0]}")
                 # write 2D gridded timeseries
                 else:
                     ds.to_netcdf(fn, encoding=encoding)

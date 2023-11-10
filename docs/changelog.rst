@@ -6,21 +6,31 @@ Distinction is made between new methods (Added), changes to existing methods (Ch
 The format is based on `Keep a Changelog`_, and this project adheres to
 `Semantic Versioning`_.
 
-v1.0.2 (unreleased)
+v1.0.2 (9 November 2023)
 ===================
+This release mostly contains bugfixes and improvements to existing methods. Some new features have been added as well, 
+such as the option to add storage volume to the model to account for green infrastructure. Another addition is the 
+generation of overviews for the Cloud Optimized GeoTIFF files for faster visualization. 
 
 Added
 -----
+- `SfincsModel.setup_storage_volume` to account for green-infrastructure PR #101
+- Added reverse_river_geom keyword argument in workflows.river_boundary_points #PR 136
+- the COG files that are written automatically contain overviews for faster visualization PR #144
 
 Changed
 -------
 - Changed `setup_cn_infiltration_with_kr` into `setup_cn_infiltration_with_ks` since saturated hydraulic conductivity (ks) is used instead of recovery rate (kr) PR #126
+- precision of coordinates in geoms and forcing now depends on CRS (geographic or not) PR #143
+
 
 Fixed
 -----
 - writing COG files in `SfincsModel.setup_subgrid` (the COG driver settings were wrong) PR #117
 - a constant offset in the `datasets_dep` argument to `SfincsModel.setup_subgrid` and `SfincsModel.setup_dep` was ignored PR #119
 - mismatch between gis data and the model grid causing issues while reading the model PR #128
+- Bugfixes in workflows.river_boundary_points to make sure function also works with geoDataFrame #PR 136
+- `utils.downscale_floodmap` now also works for large (rotated) grids PR #145
 
 Deprecated
 ----------
