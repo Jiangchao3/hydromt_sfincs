@@ -1,6 +1,7 @@
 """
 SfincsModel class
 """
+
 from __future__ import annotations
 
 import glob
@@ -15,15 +16,19 @@ import hydromt
 import numpy as np
 import pandas as pd
 import xarray as xr
+import xugrid as xu
 from hydromt.models.model_grid import GridModel
 from hydromt.vector import GeoDataArray, GeoDataset
 from hydromt.workflows.forcing import da_to_timedelta
 from pyproj import CRS
 from shapely.geometry import LineString, box
+from xugrid.core.wrap import UgridDataArray
 
-from . import DATADIR, plots, utils, workflows
-from .regulargrid import RegularGrid
-from .sfincs_input import SfincsInput
+from hydromt_sfincs import DATADIR, plots, utils, workflows
+from hydromt_sfincs.quadtree import QuadtreeGrid
+from hydromt_sfincs.regulargrid import RegularGrid
+from hydromt_sfincs.sfincs_input import SfincsInput
+from hydromt_sfincs.subgrid import SubgridTableRegular
 
 __all__ = ["SfincsModel"]
 
@@ -60,7 +65,7 @@ class SfincsModel(GridModel):
         "press_2d": ("netamp", {"barometric_pressure": "press_2d"}),
         "wind_2d": (
             "netamuamv",
-            {"eastward_wind": "wind_u", "northward_wind": "wind_v"},
+            {"eastward_wind": "wind10_u", "northward_wind": "wind10_v"},
         ),
     }
     _FORCING_SPW = {"spiderweb": "spw"}  # TODO add read and write functions
@@ -86,8 +91,8 @@ class SfincsModel(GridModel):
         "precip": {"standard_name": "precipitation", "unit": "mm.hr-1"},
         "precip_2d": {"standard_name": "precipitation", "unit": "mm.hr-1"},
         "press_2d": {"standard_name": "barometric pressure", "unit": "Pa"},
-        "wind_u": {"standard_name": "eastward wind", "unit": "m/s"},
-        "wind_v": {"standard_name": "northward wind", "unit": "m/s"},
+        "wind10_u": {"standard_name": "eastward wind", "unit": "m/s"},
+        "wind10_v": {"standard_name": "northward wind", "unit": "m/s"},
         "wnd": {"standard_name": "wind", "unit": "m/s"},
     }
 
@@ -137,6 +142,16 @@ class SfincsModel(GridModel):
         self.quadtree = None
         self.subgrid = xr.Dataset()
 
+    def __del__(self):
+        """Close the model and remove the logger file handler."""
+        for handler in self.logger.handlers:
+            if (
+                isinstance(handler, logging.FileHandler)
+                and "hydromt.log" in handler.baseFilename
+            ):
+                handler.close()
+                self.logger.removeHandler(handler)
+
     @property
     def mask(self) -> xr.DataArray | None:
         """Returns model mask"""
@@ -145,6 +160,11 @@ class SfincsModel(GridModel):
                 return self.grid["msk"]
             elif self.reggrid is not None:
                 return self.reggrid.empty_mask
+        elif self.grid_type == "quadtree":
+            if "msk" in self.quadtree.data:
+                return self.quadtree.data["msk"]
+            elif self.quadtree is not None:
+                return self.quadtree.empty_mask
 
     @property
     def region(self) -> gpd.GeoDataFrame:
@@ -153,13 +173,32 @@ class SfincsModel(GridModel):
         region = gpd.GeoDataFrame()
         if "region" in self.geoms:
             region = self.geoms["region"]
-        elif "msk" in self.grid and np.any(self.grid["msk"] > 0):
-            da = xr.where(self.mask > 0, 1, 0).astype(np.int16)
-            da.raster.set_nodata(0)
-            region = da.raster.vectorize().dissolve()
-        elif self.reggrid is not None:
-            region = self.reggrid.empty_mask.raster.box
+        elif self.grid_type == "regular":
+            if "msk" in self.grid and np.any(self.grid["msk"] > 0):
+                da = xr.where(self.mask > 0, 1, 0).astype(np.int16)
+                da.raster.set_nodata(0)
+                region = da.raster.vectorize().dissolve()
+            elif self.reggrid is not None:
+                region = self.reggrid.empty_mask.raster.box
+        elif self.grid_type == "quadtree":
+            region = self.quadtree.exterior
         return region
+
+    @property
+    def bounds(self) -> List[float]:
+        """Returns the bounding box of the model grid."""
+        if self.grid_type == "regular":
+            return self.mask.raster.bounds
+        elif self.grid_type == "quadtree":
+            return self.mask.ugrid.total_bounds
+
+    @property
+    def bbox(self) -> tuple:
+        """Returns the bounding box in WGS 84 of the model grid."""
+        if self.grid_type == "regular":
+            return self.mask.raster.transform_bounds(4326)
+        elif self.grid_type == "quadtree":
+            return self.mask.ugrid.to_crs(4326).ugrid.total_bounds
 
     @property
     def crs(self) -> CRS | None:
@@ -167,7 +206,7 @@ class SfincsModel(GridModel):
         if self.grid_type == "regular":
             return self.reggrid.crs
         elif self.grid_type == "quadtree":
-            return self.quadtree.crs
+            return self.quadtree.data.grid.crs
 
     def set_crs(self, crs: Any) -> None:
         """Sets the model crs"""
@@ -175,7 +214,7 @@ class SfincsModel(GridModel):
             self.reggrid.crs = CRS.from_user_input(crs)
             self.grid.raster.set_crs(self.reggrid.crs)
         elif self.grid_type == "quadtree":
-            self.quadtree.crs = CRS.from_user_input(crs)
+            self.quadtree.data.grid.set_crs(CRS.from_user_input(crs))
 
     def setup_grid(
         self,
@@ -205,6 +244,10 @@ class SfincsModel(GridModel):
         """
         # TODO gdf_refinement for quadtree
 
+        # clean old grid
+        self._grid = None
+
+        # setup regular grid
         self.config.update(
             x0=x0,
             y0=y0,
@@ -291,7 +334,7 @@ class SfincsModel(GridModel):
         # create grid from region
         # NOTE keyword rotated is added to still have the possibility to create unrotated grids if needed (e.g. for FEWS?)
         if rotated:
-            geom = self.geoms["region"].unary_union
+            geom = self.geoms["region"].union_all()
             x0, y0, mmax, nmax, rot = utils.rotated_grid(
                 geom, res, dec_origin=dec_origin, dec_rotation=dec_rotation
             )
@@ -614,11 +657,14 @@ class SfincsModel(GridModel):
         datasets_rgh: List[dict] = [],
         datasets_riv: List[dict] = [],
         buffer_cells: int = 0,
-        nbins: int = 10,
+        nlevels: int = 10,
+        nbins: int = None,
         nr_subgrid_pixels: int = 20,
         nrmax: int = 2000,  # blocksize
-        max_gradient: float = 5.0,
+        max_gradient: float = 99999.0,
         z_minimum: float = -99999.0,
+        huthresh: float = 0.01,
+        q_table_option: int = 2,
         manning_land: float = 0.04,
         manning_sea: float = 0.02,
         rgh_lev_land: float = 0.0,
@@ -678,6 +724,7 @@ class SfincsModel(GridModel):
               rivdph or rivbed (river depth [m]; river bedlevel [m+REF]),
               manning (Manning's n [s/m^(1/3)]; optional)
             * mask (optional): filename (or Path) of river mask
+            * point_zb (optional): filename (or Path) of river points with bed (z) values
             * river attributes (optional): "rivdph", "rivbed", "rivwth", "manning"
               to fill missing values
             * arguments to the river burn method (optional):
@@ -695,6 +742,9 @@ class SfincsModel(GridModel):
             by default 0
         nbins : int, optional
             Number of bins in which hypsometry is subdivided, by default 10
+            Note that this keyword is deprecated and will be removed in future versions.
+        nlevels: int, optional
+            Number of levels to describe hypsometry, by default 10
         nr_subgrid_pixels : int, optional
             Number of subgrid pixels per computational cell, by default 20
         nrmax : int, optional
@@ -705,6 +755,12 @@ class SfincsModel(GridModel):
             to prevent numerical stability problems, by default 5.0
         z_minimum : float, optional
             Minimum depth in the subgrid tables, by default -99999.0
+        huthresh : float, optional
+            Threshold depth in SFINCS model, by default 0.01 m
+        q_table_option : int, optional
+            Option for the computation of the representative roughness and conveyance depth at u/v points, by default 2.
+            1: "old" weighting method, compliant with SFINCS < v2.1.1, taking the avarage of the adjacent cells
+            2: "improved" weighting method, recommended for SFINCS >= v2.1.1, that takes into account the wet fractions of the adjacent cells
         manning_land, manning_sea : float, optional
             Constant manning roughness values for land and sea, by default 0.04 and 0.02 s.m-1/3
             Note that these values are only used when no Manning's n datasets are provided,
@@ -742,6 +798,17 @@ class SfincsModel(GridModel):
         else:
             highres_dir = None
 
+        if nbins is not None:
+            logger.warning(
+                "Keyword nbins is deprecated and will be removed in future versions. Please use nlevels instead."
+            )
+            nlevels = nbins
+
+        if q_table_option == 1 and max_gradient > 20.0:
+            raise ValueError(
+                "For the old q_table_option, a max_gradient of 5.0 is recommended to improve numerical stability"
+            )
+
         if self.grid_type == "regular":
             self.reggrid.subgrid.build(
                 da_mask=self.mask,
@@ -749,11 +816,13 @@ class SfincsModel(GridModel):
                 datasets_rgh=datasets_rgh,
                 datasets_riv=datasets_riv,
                 buffer_cells=buffer_cells,
-                nbins=nbins,
+                nlevels=nlevels,
                 nr_subgrid_pixels=nr_subgrid_pixels,
                 nrmax=nrmax,
                 max_gradient=max_gradient,
                 z_minimum=z_minimum,
+                huthresh=huthresh,
+                q_table_option=q_table_option,
                 manning_land=manning_land,
                 manning_sea=manning_sea,
                 rgh_lev_land=rgh_lev_land,
@@ -768,8 +837,11 @@ class SfincsModel(GridModel):
         elif self.grid_type == "quadtree":
             pass
 
-        if "sbgfile" not in self.config:  # only add sbgfile if not already present
-            self.config.update({"sbgfile": "sfincs.sbg"})
+        # when building a new subgrid table, always update config
+        # NOTE from now onwards, netcdf subgrid tables are used
+        self.config.update({"sbgfile": "sfincs_subgrid.nc"})
+        # if "sbgfile" not in self.config:  # only add sbgfile if not already present
+        #     self.config.update({"sbgfile": "sfincs.sbg"})
         # subgrid is used so no depfile or manningfile needed
         if "depfile" in self.config:
             self.config.pop("depfile")  # remove depfile from config
@@ -780,6 +852,7 @@ class SfincsModel(GridModel):
         self,
         rivers: Union[str, Path, gpd.GeoDataFrame] = None,
         hydrography: Union[str, Path, xr.Dataset] = None,
+        buffer: float = 200,
         river_upa: float = 10.0,
         river_len: float = 1e3,
         river_width: float = 500,
@@ -787,6 +860,7 @@ class SfincsModel(GridModel):
         first_index: int = 1,
         keep_rivers_geom: bool = False,
         reverse_river_geom: bool = False,
+        src_type: str = "inflow",
     ):
         """Setup discharge (src) points where a river enters the model domain.
 
@@ -799,7 +873,8 @@ class SfincsModel(GridModel):
         Discharge is set to zero at these points, but can be updated
         using the `setup_discharge_forcing` or `setup_discharge_forcing_from_grid` methods.
 
-        Note: this method assumes the rivers are directed from up- to downstream.
+        Note: this method assumes the rivers are directed from up- to downstream. Use
+        `reverse_river_geom=True` if the rivers are directed from downstream to upstream.
 
         Adds model layers:
 
@@ -816,6 +891,10 @@ class SfincsModel(GridModel):
             Path, data source name, or a xarray raster object for hydrography data.
 
             * Required layers: ['uparea', 'flwdir'].
+        buffer: float, optional
+            Buffer around the model region boundary to define in/outflow points [m],
+            by default 200 m. We suggest to use a buffer of at least twice the hydrography
+            resolution. Inflow points are moved to a downstreawm confluence if within the buffer.
         river_upa : float, optional
             Minimum upstream area threshold for rivers [km2], by default 10.0
         river_len: float, optional
@@ -833,23 +912,29 @@ class SfincsModel(GridModel):
         reverse_river_geom: bool, optional
             If True, assume that segments in 'rivers' are drawn from downstream to upstream.
             Only used if 'rivers' is not None, By default False
+        src_type: {'inflow', 'headwater'}, optional
+            Source type, by default 'inflow'
+            If 'inflow', return points where the river flows into the model domain.
+            If 'headwater', return all headwater (including inflow) points within the model domain.
 
         See Also
         --------
         setup_discharge_forcing
         setup_discharge_forcing_from_grid
         """
-        da_flwdir, da_uparea, gdf_riv = None, None, None
+        # get hydrography data
+        da_uparea = None
         if hydrography is not None:
             ds = self.data_catalog.get_rasterdataset(
                 hydrography,
-                bbox=self.mask.raster.transform_bounds(4326),
+                bbox=self.bbox,
                 variables=["uparea", "flwdir"],
                 buffer=5,
             )
-            da_flwdir = ds["flwdir"]
-            da_uparea = ds["uparea"]
-        elif (
+            da_uparea = ds["uparea"]  # reused in river_source_points
+
+        # get river centerlines
+        if (
             isinstance(rivers, str)
             and rivers == "rivers_outflow"
             and rivers in self.geoms
@@ -860,24 +945,30 @@ class SfincsModel(GridModel):
             gdf_riv = self.data_catalog.get_geodataframe(
                 rivers, geom=self.region
             ).to_crs(self.crs)
-        else:
+        elif hydrography is not None:
+            gdf_riv = workflows.river_centerline_from_hydrography(
+                da_flwdir=ds["flwdir"],
+                da_uparea=da_uparea,
+                river_upa=river_upa,
+                river_len=river_len,
+                gdf_mask=self.region,
+            )
+        elif hydrography is None:
             raise ValueError("Either hydrography or rivers must be provided.")
 
-        gdf_src, gdf_riv = workflows.river_boundary_points(
-            region=self.region,
-            res=self.reggrid.dx,
+        # get river inflow / headwater source points
+        gdf_src = workflows.river_source_points(
             gdf_riv=gdf_riv,
-            da_flwdir=da_flwdir,
-            da_uparea=da_uparea,
-            river_len=river_len,
+            gdf_mask=self.region,
+            src_type=src_type,
+            buffer=buffer,
             river_upa=river_upa,
-            inflow=True,
+            river_len=river_len,
+            da_uparea=da_uparea,
             reverse_river_geom=reverse_river_geom,
             logger=self.logger,
         )
-        n = len(gdf_src.index)
-        self.logger.info(f"Found {n} river inflow points.")
-        if n == 0:
+        if gdf_src.empty:
             return
 
         # set forcing src pnts
@@ -968,17 +1059,19 @@ class SfincsModel(GridModel):
         --------
         setup_mask_bounds
         """
-        da_flwdir, da_uparea, gdf_riv = None, None, None
+        # get hydrography data
+        da_uparea = None
         if hydrography is not None:
             ds = self.data_catalog.get_rasterdataset(
                 hydrography,
-                bbox=self.mask.raster.transform_bounds(4326),
+                bbox=self.bbox,
                 variables=["uparea", "flwdir"],
                 buffer=5,
             )
-            da_flwdir = ds["flwdir"]
-            da_uparea = ds["uparea"]
-        elif (
+            da_uparea = ds["uparea"]  # reused in river_source_points
+
+        # get river centerlines
+        if (
             isinstance(rivers, str)
             and rivers == "rivers_inflow"
             and rivers in self.geoms
@@ -989,22 +1082,36 @@ class SfincsModel(GridModel):
             gdf_riv = self.data_catalog.get_geodataframe(
                 rivers, geom=self.region
             ).to_crs(self.crs)
+        elif hydrography is not None:
+            gdf_riv = workflows.river_centerline_from_hydrography(
+                da_flwdir=ds["flwdir"],
+                da_uparea=da_uparea,
+                river_upa=river_upa,
+                river_len=river_len,
+                gdf_mask=self.region,
+            )
         else:
             raise ValueError("Either hydrography or rivers must be provided.")
 
-        # TODO reproject region and gdf_riv to utm zone if model crs is geographic
-        gdf_out, gdf_riv = workflows.river_boundary_points(
-            region=self.region,
-            res=self.reggrid.dx,
+        # estimate buffer based on model resolution
+        buffer = self.reggrid.dx
+        if self.crs.is_geographic:
+            buffer = buffer * 111111.0
+
+        # get river inflow / headwater source points
+        gdf_out = workflows.river_source_points(
             gdf_riv=gdf_riv,
-            da_flwdir=da_flwdir,
-            da_uparea=da_uparea,
-            river_len=river_len,
+            gdf_mask=self.region,
+            src_type="outflow",
+            buffer=buffer,
             river_upa=river_upa,
-            inflow=False,
+            river_len=river_len,
+            da_uparea=da_uparea,
             reverse_river_geom=reverse_river_geom,
             logger=self.logger,
         )
+        if gdf_out.empty:
+            return
 
         if len(gdf_out) > 0:
             if "rivwth" in gdf_out.columns:
@@ -1014,11 +1121,11 @@ class SfincsModel(GridModel):
             if np.any(self.mask == 2) and btype == "outflow":
                 gdf_msk2 = utils.get_bounds_vector(self.mask)
                 # NOTE: this should be a single geom
-                geom = gdf_msk2[gdf_msk2["value"] == 2].unary_union
+                geom = gdf_msk2[gdf_msk2["value"] == 2].union_all()
                 gdf_out = gdf_out[~gdf_out.intersects(geom)]
             # remove outflow points near source points
             if "dis" in self.forcing and len(gdf_out) > 0:
-                geom = self.forcing["dis"].vector.to_gdf().unary_union
+                geom = self.forcing["dis"].vector.to_gdf().union_all()
                 gdf_out = gdf_out[~gdf_out.intersects(geom)]
 
         # update mask
@@ -1066,7 +1173,7 @@ class SfincsModel(GridModel):
         if qinf is not None:
             da_inf = self.data_catalog.get_rasterdataset(
                 qinf,
-                bbox=self.mask.raster.transform_bounds(4326),
+                bbox=self.bbox,
                 buffer=10,
             )
         elif lulc is not None:
@@ -1077,7 +1184,7 @@ class SfincsModel(GridModel):
                 )
             da_lulc = self.data_catalog.get_rasterdataset(
                 lulc,
-                bbox=self.mask.raster.transform_bounds(4326),
+                bbox=self.bbox,
                 buffer=10,
                 variables=["lulc"],
             )
@@ -1137,9 +1244,7 @@ class SfincsModel(GridModel):
             By default 'med'. For more information see, :py:meth:`hydromt.raster.RasterDataArray.reproject_like`
         """
         # get data
-        da_org = self.data_catalog.get_rasterdataset(
-            cn, bbox=self.mask.raster.transform_bounds(4326), buffer=10
-        )
+        da_org = self.data_catalog.get_rasterdataset(cn, bbox=self.bbox, buffer=10)
         # read variable
         v = "cn"
         if antecedent_moisture:
@@ -1165,7 +1270,7 @@ class SfincsModel(GridModel):
 
     # Function to create curve number for SFINCS including recovery via saturated hydraulic conductivity [mm/hr]
     def setup_cn_infiltration_with_ks(
-        self, lulc, hsg, ksat, reclass_table, effective, block_size=2000
+        self, lulc, hsg, ksat, reclass_table, effective, factor_ksat=1, block_size=2000
     ):
         """Setup model the Soil Conservation Service (SCS) Curve Number (CN) files for SFINCS
         including recovery term based on the soil saturation
@@ -1182,20 +1287,18 @@ class SfincsModel(GridModel):
             reclass table to relate landcover with soiltype
         effective : float
             estimate of percentage effective soil, e.g. 0.50 for 50%
+        factor_ksat : float
+            factor to convert units of Ksat, e.g. from micrometer per second to mm/hr
         block_size : float
             maximum block size - use larger values will get more data in memory but can be faster, default=2000
         """
 
         # Read the datafiles
         da_landuse = self.data_catalog.get_rasterdataset(
-            lulc, bbox=self.mask.raster.transform_bounds(4326), buffer=10
+            lulc, bbox=self.bbox, buffer=10
         )
-        da_HSG = self.data_catalog.get_rasterdataset(
-            hsg, bbox=self.mask.raster.transform_bounds(4326), buffer=10
-        )
-        da_Ksat = self.data_catalog.get_rasterdataset(
-            ksat, bbox=self.mask.raster.transform_bounds(4326), buffer=10
-        )
+        da_HSG = self.data_catalog.get_rasterdataset(hsg, bbox=self.bbox, buffer=10)
+        da_Ksat = self.data_catalog.get_rasterdataset(ksat, bbox=self.bbox, buffer=10)
         df_map = self.data_catalog.get_dataframe(reclass_table, index_col=0)
 
         # Define outputs
@@ -1249,7 +1352,7 @@ class SfincsModel(GridModel):
                 ib += 1
                 self.logger.debug(
                     f"\nblock {ib + 1}/{nrbn * nrbm} -- "
-                    f"col {bm0}:{bm1-1} | row {bn0}:{bn1-1}"
+                    f"col {bm0}:{bm1 - 1} | row {bn0}:{bn1 - 1}"
                 )
 
                 # calculate transform and shape of block at cell and subgrid level
@@ -1271,7 +1374,10 @@ class SfincsModel(GridModel):
                 da_ks[sn, sm] = da_ks_block
 
         # Done
-        self.logger.info(f"Done with determination of values (in blocks).")
+        self.logger.info("Done with determination of values (in blocks).")
+
+        # Convert ks - (e.g. from micrometer per second to mm/hr which is required in SFINCS)
+        da_ks = da_ks * factor_ksat
 
         # Specify the effective soil retention (seff)
         da_seff = da_smax
@@ -1394,7 +1500,7 @@ class SfincsModel(GridModel):
         if merge and name in self.geoms:
             gdf0 = self._geoms.pop(name)
             gdf_obs = gpd.GeoDataFrame(pd.concat([gdf_obs, gdf0], ignore_index=True))
-            self.logger.info(f"Adding new observation points to existing ones.")
+            self.logger.info("Adding new observation points to existing ones.")
 
         self.set_geoms(gdf_obs, name)
         self.set_config(f"{name}file", f"sfincs.{name}")
@@ -1437,7 +1543,7 @@ class SfincsModel(GridModel):
         if merge and name in self.geoms:
             gdf0 = self._geoms.pop(name)
             gdf_obs = gpd.GeoDataFrame(pd.concat([gdf_obs, gdf0], ignore_index=True))
-            self.logger.info(f"Adding new observation lines to existing ones.")
+            self.logger.info("Adding new observation lines to existing ones.")
 
         self.set_geoms(gdf_obs, name)
         self.set_config(f"{name}file", f"sfincs.{name}")
@@ -1737,6 +1843,17 @@ class SfincsModel(GridModel):
                 )
             tref = utils.parse_datetime(self.config["tref"])
             df_ts.index = tref + pd.to_timedelta(df_ts.index, unit="sec")
+        # Check if df_ts covers the model time and has at least two values
+        tstart, tstop = self.get_model_time()  # model time
+        if df_ts is not None:
+            if df_ts.index.min() > tstart or df_ts.index.max() < tstop:
+                self.logger.warning(
+                    "The provided timeseries does not cover the entire model time period."
+                )
+            if df_ts.shape[0] < 2:
+                raise ValueError(
+                    "The provided timeseries must have at least two data points (from tstart to tstop)."
+                )
         # parse location index
         if (
             gdf_locs is not None
@@ -1753,7 +1870,7 @@ class SfincsModel(GridModel):
             if not set(gdf_locs.index) == set(df_ts.columns):
                 gdf_locs = gdf_locs.set_index(df_ts.columns)
                 self.logger.info(
-                    f"No matching index column found in gdf_locs; assuming the order is correct"
+                    "No matching index column found in gdf_locs; assuming the order is correct"
                 )
         # merge with existing data
         if name in self.forcing and merge:
@@ -1844,7 +1961,7 @@ class SfincsModel(GridModel):
         gdf_locs, df_ts = None, None
         tstart, tstop = self.get_model_time()  # model time
         # buffer around msk==2 values
-        if np.any(self.mask == 2):
+        if np.any(self.mask == 2) and not self.grid_type == "quadtree":
             region = self.mask.where(self.mask == 2, 0).raster.vectorize()
         else:
             region = self.region
@@ -1887,6 +2004,13 @@ class SfincsModel(GridModel):
         elif gdf_locs is None:
             raise ValueError("No waterlevel boundary (bnd) points provided.")
 
+        # It is still possible that all points are outside the region+buffer, this error should provide clear feedback
+        if gdf_locs.is_empty.all():
+            raise ValueError(
+                "All waterlevel boundary points provided are outside the active model domain plus specified buffer. "
+                "Check the provided locations or increase the value of the buffer argument."
+            )
+
         # optionally read offset data and correct df_ts
         if offset is not None and gdf_locs is not None:
             if isinstance(offset, (float, int)):
@@ -1894,7 +2018,7 @@ class SfincsModel(GridModel):
             else:
                 da_offset = self.data_catalog.get_rasterdataset(
                     offset,
-                    bbox=self.mask.raster.transform_bounds(4326),
+                    bbox=self.bbox,
                     buffer=5,
                 )
                 offset_pnts = da_offset.raster.sample(gdf_locs)
@@ -2109,7 +2233,7 @@ class SfincsModel(GridModel):
         # read data
         ds = self.data_catalog.get_rasterdataset(
             discharge,
-            bbox=self.mask.raster.transform_bounds(4326),
+            bbox=self.bbox,
             buffer=2,
             time_tuple=self.get_model_time(),  # model time
             variables=["discharge"],
@@ -2118,7 +2242,7 @@ class SfincsModel(GridModel):
         if uparea is not None and "uparea" in gdf.columns:
             da_upa = self.data_catalog.get_rasterdataset(
                 uparea,
-                bbox=self.mask.raster.transform_bounds(4326),
+                bbox=self.bbox,
                 buffer=2,
                 variables=["uparea"],
             )
@@ -2180,7 +2304,7 @@ class SfincsModel(GridModel):
         # get data for model domain and config time range
         precip = self.data_catalog.get_rasterdataset(
             precip,
-            bbox=self.mask.raster.transform_bounds(4326),
+            bbox=self.bbox,
             buffer=2,
             time_tuple=self.get_model_time(),
             variables=["precip"],
@@ -2277,7 +2401,7 @@ class SfincsModel(GridModel):
         press, str, Path, xr.Dataset, xr.DataArray
             Path to pressure rasterdataset netcdf file or xarray dataset.
 
-            * Required variables: ['press' (Pa)]
+            * Required variables: ['press_msl' (Pa)]
             * Required coordinates: ['time', 'y', 'x']
 
         dst_res: float
@@ -2293,7 +2417,7 @@ class SfincsModel(GridModel):
             geom=self.region,
             buffer=2,
             time_tuple=self.get_model_time(),
-            variables=["press"],
+            variables=["press_msl"],
         )
 
         # reproject to model utm crs
@@ -2335,7 +2459,7 @@ class SfincsModel(GridModel):
         wind, str, Path, xr.Dataset
             Path to wind rasterdataset (including eastward and northward components) netcdf file or xarray dataset.
 
-            * Required variables: ['wind_u' (m/s), 'wind_v' (m/s)]
+            * Required variables: ['wind10_u' (m/s), 'wind10_v' (m/s)]
             * Required coordinates: ['time', 'y', 'x']
 
         dst_res: float
@@ -2347,7 +2471,7 @@ class SfincsModel(GridModel):
             geom=self.region,
             buffer=2,
             time_tuple=self.get_model_time(),
-            variables=["wind_u", "wind_v"],
+            variables=["wind10_u", "wind10_v"],
         )
 
         # reproject to model utm crs
@@ -2675,11 +2799,17 @@ class SfincsModel(GridModel):
         if isinstance(variable, xr.DataArray):
             ds = variable.to_dataset()
             variable = variable.name
+        elif isinstance(variable, xu.UgridDataArray):
+            ds = variable.to_dataset()
+            variable = variable.name
         elif variable.startswith("subgrid.") and self.subgrid is not None:
             ds = self.subgrid.copy()
             variable = variable.replace("subgrid.", "")
         else:
-            ds = self.grid.copy()
+            if self.grid_type == "regular":
+                ds = self.grid.copy()
+            elif self.grid_type == "quadtree":
+                ds = self.quadtree.data.copy()
             if "msk" not in ds:
                 ds["msk"] = self.mask
 
@@ -2697,6 +2827,7 @@ class SfincsModel(GridModel):
             geom_names=geom_names,
             geom_kwargs=geom_kwargs,
             legend_kwargs=legend_kwargs,
+            logger=self.logger,
             **kwargs,
         )
 
@@ -2715,7 +2846,16 @@ class SfincsModel(GridModel):
         self.read_config(epsg=epsg)
         if epsg is None and "epsg" not in self.config:
             raise ValueError("Please specify epsg to read this model")
-        self.read_grid()
+        if self.grid_type == "regular":
+            self.read_grid()
+        elif self.grid_type == "quadtree":
+            fn = self.get_config("qtrfile", fallback="sfincs.nc", abs_path=True)
+            if not isfile(fn):
+                raise IOError(f".nc path {fn} does not exist")
+            self.quadtree.read(file_name=fn)
+            # remove grid from api and model
+            self._API.pop("grid", None)
+            self._grid = None
         self.read_subgrid()
         self.read_geoms()
         self.read_forcing()
@@ -2725,15 +2865,23 @@ class SfincsModel(GridModel):
         """Write the complete model schematization and configuration to file."""
         self.logger.info(f"Writing model data to {self.root}")
         # TODO - add check for subgrid & quadtree > give flags to self.write_grid() and self.write_config()
-        self.write_grid()
+        if self.grid_type == "regular":
+            self.write_grid()
+        elif self.grid_type == "quadtree":
+            fn = self.get_config("qtrfile", abs_path=True)
+            self.quadtree.write(file_name=fn)
         self.write_subgrid()
         self.write_geoms()
         self.write_forcing()
         self.write_states()
         # config last; might be udpated when writing maps, states or forcing
         self.write_config()
-        # write data catalog with used data sources
-        self.write_data_catalog()  # new in hydromt v0.4.4
+        # FIXME - erroneous data catalog writing should be avoided to prevent errors later on
+        # # write data catalog with used data sources
+        # try:
+        #     self.write_data_catalog()  # new in hydromt v0.4.4
+        # except Exception as e:
+        #     self.logger.error(f"Error writing data catalog: {str(e)}")
 
     def read_grid(self, data_vars: Union[List, str] = None) -> None:
         """Read SFINCS binary grid files and save to `grid` attribute.
@@ -2780,6 +2928,17 @@ class SfincsModel(GridModel):
             if epsg is not None:
                 ds.raster.set_crs(epsg)
             self.set_grid(ds)
+
+            # TODO - fix this properly; but to create overlays in GUIs,
+            # we always convert regular grids to a UgridDataArray
+            self.quadtree = QuadtreeGrid(logger=self.logger)
+            if self.config.get("rotation", 0) != 0:  # This is a rotated regular grid
+                self.quadtree.data = UgridDataArray.from_structured(
+                    self.mask, "xc", "yc"
+                )
+            else:
+                self.quadtree.data = UgridDataArray.from_structured(self.mask)
+            self.quadtree.data.grid.set_crs(self.crs)
 
             # keep some metadata maps from gis directory
             fns = glob.glob(join(self.root, "gis", "*.tif"))
@@ -2852,20 +3011,44 @@ class SfincsModel(GridModel):
                 self.logger.warning(f"sbgfile not found at {fn}")
                 return
 
-            self.reggrid.subgrid.load(file_name=fn, mask=self.mask)
-            self.subgrid = self.reggrid.subgrid.to_xarray(
-                dims=self.mask.raster.dims, coords=self.mask.raster.coords
-            )
+            if self.grid_type == "regular":
+                # TODO: come up with a better way to handle this
+                self.reggrid.subgrid = SubgridTableRegular()
+                self.subgrid = xr.Dataset()
+
+                # read subgrid file
+                if fn.parts[-1].endswith(".sbg"):  # read binary file
+                    self.reggrid.subgrid.read_binary(file_name=fn, mask=self.mask)
+                else:  # read netcdf file
+                    self.reggrid.subgrid.read(file_name=fn, mask=self.mask)
+                self.subgrid = self.reggrid.subgrid.to_xarray(
+                    dims=self.mask.raster.dims, coords=self.mask.raster.coords
+                )
+            else:
+                self.quadtree.subgrid.read(file_name=fn)
 
     def write_subgrid(self):
         """Write SFINCS subgrid file."""
         self._assert_write_mode
 
-        if self.subgrid:
+        if self.grid_type == "regular" and self.subgrid:
             if "sbgfile" not in self.config:
-                self.set_config("sbgfile", "sfincs.sbg")
+                # apparently no subgrid was read, so set default filename
+                self.set_config("sbgfile", "sfincs_subgrid.nc")
             fn = self.get_config("sbgfile", abs_path=True)
-            self.reggrid.subgrid.save(file_name=fn, mask=self.mask)
+            if fn.parts[-1].endswith(".sbg"):
+                # write binary file
+                self.reggrid.subgrid.write_binary(file_name=fn, mask=self.mask)
+            else:
+                # write netcdf file
+                self.reggrid.subgrid.write(file_name=fn, mask=self.mask)
+        elif self.grid_type == "quadtree" and self.quadtree.subgrid.data is not None:
+            if "sbgfile" not in self.config:
+                # apparently no subgrid was read, so set default filename
+                self.set_config("sbgfile", "sfincs_subgrid.nc")
+
+            fn = self.get_config("sbgfile", abs_path=True)
+            self.quadtree.subgrid.write(file_name=fn)
 
     def read_geoms(self):
         """Read geometry files and save to `geoms` attribute.
@@ -3033,6 +3216,7 @@ class SfincsModel(GridModel):
         for name in dvars_2d:
             fname, rename = self._FORCING_NET[name]
             fn = self.get_config(f"{fname}file", abs_path=True)
+            ds = None
             if fn is None or not isfile(fn):
                 if fn is not None:
                     self.logger.warning(f"{name}file not found at {fn}")
@@ -3041,6 +3225,7 @@ class SfincsModel(GridModel):
                 ds = GeoDataset.from_netcdf(fn, crs=self.crs, chunks="auto")
             else:
                 ds = xr.open_dataset(fn, chunks="auto")
+
             rename = {k: v for k, v in rename.items() if k in ds}
             if len(rename) > 0:
                 ds = ds.rename(rename).squeeze(drop=True)[list(rename.values())]
@@ -3048,7 +3233,10 @@ class SfincsModel(GridModel):
             else:
                 logger.warning(f"No forcing variables found in {fname}file")
 
-    def write_forcing(self, data_vars: Union[List, str] = None):
+            if ds is not None:
+                ds.close()
+
+    def write_forcing(self, data_vars: Union[List, str] = None, fmt: str = "%7.2f"):
         """Write forcing to ascii or netcdf (netampr) files.
         Filenames are based on the `config` attribute.
 
@@ -3056,14 +3244,16 @@ class SfincsModel(GridModel):
         ----------
         data_vars : list of str, optional
             List of data variables to write, by default None (all)
+        fmt : str, optional
+            Format string for timeseries data, by default "%7.2f".
         """
         self._assert_write_mode
 
         # change precision of coordinates according to crs
         if self.crs.is_geographic:
-            fmt = "%.6f"
+            fmt_xy = "%.6f"
         else:
-            fmt = "%.1f"
+            fmt_xy = "%.1f"
 
         if self.forcing:
             self.logger.info("Write forcing files")
@@ -3101,7 +3291,7 @@ class SfincsModel(GridModel):
                         self.set_config(f"{ts_name}file", f"sfincs.{ts_name}")
                     fn = self.get_config(f"{ts_name}file", abs_path=True)
                     # write timeseries
-                    utils.write_timeseries(fn, df, tref)
+                    utils.write_timeseries(fn, df, tref, fmt=fmt)
                 # write xy
                 if xy_name and da is not None:
                     # parse data to geodataframe
@@ -3114,7 +3304,7 @@ class SfincsModel(GridModel):
                         self.set_config(f"{xy_name}file", f"sfincs.{xy_name}")
                     fn_xy = self.get_config(f"{xy_name}file", abs_path=True)
                     # write xy
-                    hydromt.io.write_xy(fn_xy, gdf, fmt=fmt)
+                    hydromt.io.write_xy(fn_xy, gdf, fmt=fmt_xy)
                     if self._write_gis:  # write geojson file to gis folder
                         self.write_vector(variables=f"forcing.{ts_names[0]}")
 
@@ -3250,16 +3440,41 @@ class SfincsModel(GridModel):
         if not isabs(fn_map):
             fn_map = join(self.root, fn_map)
         if isfile(fn_map):
-            ds_face, ds_edge = utils.read_sfincs_map_results(
-                fn_map,
-                ds_like=self.grid,  # TODO: fix for quadtree
-                drop=drop,
-                logger=self.logger,
-                **kwargs,
-            )
-            # save as dict of DataArray
-            self.set_results(ds_face, split_dataset=True)
-            self.set_results(ds_edge, split_dataset=True)
+            if self.grid_type is None:
+                self.logger.warning(
+                    "Grid type not known, trying to read from config file. "
+                )
+                self.read_config()
+            if self.grid_type == "regular":
+                ds_face, ds_edge = utils.read_sfincs_map_results(
+                    fn_map,
+                    ds_like=self.grid,  # TODO: fix for quadtree
+                    drop=drop,
+                    logger=self.logger,
+                    **kwargs,
+                )
+                # save as dict of DataArray
+                self.set_results(ds_face, split_dataset=True)
+                self.set_results(ds_edge, split_dataset=True)
+            elif self.grid_type == "quadtree":
+                dsu = utils.xu_open_dataset(
+                    fn_map,
+                    chunks={"time": chunksize},
+                )
+
+                # set coords
+                dsu = dsu.set_coords(["mesh2d_node_x", "mesh2d_node_y"])
+                # get crs variable, drop it and set it correctly
+                crs = dsu["crs"].values
+                dsu.drop_vars("crs")
+                dsu.grid.set_crs(CRS.from_user_input(crs))
+
+                # NOTE the set_results of the model api doesnt support ugrid
+                self._initialize_results()
+                for name in dsu.variables:
+                    if name in self._results:
+                        self.logger.warning(f"Replacing result: {name}")
+                    self._results[name] = dsu[name]
 
         if not isabs(fn_his):
             fn_his = join(self.root, fn_his)
@@ -3334,6 +3549,9 @@ class SfincsModel(GridModel):
                             f"Variable {attr}.{layer} has more than 2 dimensions: skipping."
                         )
                         continue
+                # If the raster type is float, set nodata to np.nan
+                if da.dtype == "float32" or da.dtype == "float64":
+                    da.raster.set_nodata(np.nan)
                 # only write active cells to gis files
                 da = da.where(self.mask > 0, da.raster.nodata).raster.mask_nodata()
                 if da.raster.res[1] > 0:  # make sure orientation is N->S
@@ -3477,9 +3695,8 @@ class SfincsModel(GridModel):
                 rotation=self.config.get("rotation", 0),
                 epsg=self.config.get("epsg"),
             )
-        else:
-            raise not NotImplementedError("Quadtree grid not implemented yet")
-            # self.quadtree = QuadtreeGrid()
+        elif self.grid_type == "quadtree":
+            self.quadtree = QuadtreeGrid(logger=self.logger)
 
     def get_model_time(self):
         """Return (tstart, tstop) tuple with parsed model start and end time"""
@@ -3516,7 +3733,7 @@ class SfincsModel(GridModel):
                 try:
                     da_elv = self.data_catalog.get_rasterdataset(
                         dataset.get("elevtn", dataset.get("da")),
-                        bbox=self.mask.raster.transform_bounds(4326),
+                        bbox=self.bbox,
                         buffer=10,
                         variables=["elevtn"],
                         zoom_level=(res, "meter"),
@@ -3537,7 +3754,7 @@ class SfincsModel(GridModel):
             if "offset" in dataset and not isinstance(dataset["offset"], (float, int)):
                 da_offset = self.data_catalog.get_rasterdataset(
                     dataset.get("offset"),
-                    bbox=self.mask.raster.transform_bounds(4326),
+                    bbox=self.bbox,
                     buffer=10,
                 )
                 dd.update({"offset": da_offset})
@@ -3546,7 +3763,7 @@ class SfincsModel(GridModel):
             if "mask" in dataset:
                 gdf_valid = self.data_catalog.get_geodataframe(
                     dataset.get("mask"),
-                    bbox=self.mask.raster.transform_bounds(4326),
+                    bbox=self.bbox,
                 )
                 dd.update({"gdf_valid": gdf_valid})
 
@@ -3588,7 +3805,7 @@ class SfincsModel(GridModel):
             if "manning" in dataset or "da" in dataset:
                 da_man = self.data_catalog.get_rasterdataset(
                     dataset.get("manning", dataset.get("da")),
-                    bbox=self.mask.raster.transform_bounds(4326),
+                    bbox=self.bbox,
                     buffer=10,
                 )
                 dd.update({"da": da_man})
@@ -3600,11 +3817,11 @@ class SfincsModel(GridModel):
                     reclass_table = join(DATADIR, "lulc", f"{lulc}_mapping.csv")
                 if reclass_table is None:
                     raise IOError(
-                        f"Manning roughness 'reclass_table' csv file must be provided"
+                        "Manning roughness 'reclass_table' csv file must be provided"
                     )
                 da_lulc = self.data_catalog.get_rasterdataset(
                     lulc,
-                    bbox=self.mask.raster.transform_bounds(4326),
+                    bbox=self.bbox,
                     buffer=10,
                     variables=["lulc"],
                 )
@@ -3619,7 +3836,7 @@ class SfincsModel(GridModel):
             if "mask" in dataset:
                 gdf_valid = self.data_catalog.get_geodataframe(
                     dataset.get("mask"),
-                    bbox=self.mask.raster.transform_bounds(4326),
+                    bbox=self.bbox,
                 )
                 dd.update({"gdf_valid": gdf_valid})
 
@@ -3650,6 +3867,8 @@ class SfincsModel(GridModel):
             "mask",
             "gdf_riv",
             "gdf_riv_mask",
+            "gdf_zb",
+            "point_zb",
         ]
         copy_keys = []
         attrs = ["rivwth", "rivdph", "rivbed", "manning"]
@@ -3666,7 +3885,7 @@ class SfincsModel(GridModel):
                 else:
                     gdf_riv = self.data_catalog.get_geodataframe(
                         rivers,
-                        geom=self.mask.raster.box,
+                        bbox=self.bbox,
                         buffer=1e3,  # 1km
                     ).to_crs(self.crs)
                 # update missing attributes based on global values
@@ -3677,17 +3896,30 @@ class SfincsModel(GridModel):
                             gdf_riv[key] = value
                         elif np.any(np.isnan(gdf_riv[key])):  # fill na
                             gdf_riv[key] = gdf_riv[key].fillna(value)
-                if not gdf_riv.columns.isin(["rivbed", "rivdph"]).any():
+                dd.update({"gdf_riv": gdf_riv})
+
+            # parse bed_level on points
+            if "point_zb" in dataset:
+                gdf_zb = self.data_catalog.get_geodataframe(
+                    dataset.get("point_zb"),
+                    bbox=self.bbox,
+                )
+                dd.update({"gdf_zb": gdf_zb})
+
+            if "gdf_riv" in dd:
+                if (
+                    not gdf_riv.columns.isin(["rivbed", "rivdph"]).any()
+                    and "gdf_zb" not in dd
+                ):
                     raise ValueError("No 'rivbed' or 'rivdph' attribute found.")
             else:
                 raise ValueError("No 'centerlines' dataset provided.")
-            dd.update({"gdf_riv": gdf_riv})
 
             # parse mask
             if "mask" in dataset:
                 gdf_riv_mask = self.data_catalog.get_geodataframe(
                     dataset.get("mask"),
-                    geom=self.mask.raster.box,
+                    bbox=self.bbox,
                 )
                 dd.update({"gdf_riv_mask": gdf_riv_mask})
             elif "rivwth" not in gdf_riv:
@@ -3695,7 +3927,6 @@ class SfincsModel(GridModel):
                     "Either mask must be provided or centerlines "
                     "should contain a 'rivwth' attribute."
                 )
-
             # copy remaining keys
             for key, value in dataset.items():
                 if key in copy_keys and key not in dd:

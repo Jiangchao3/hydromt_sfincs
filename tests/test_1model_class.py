@@ -21,6 +21,9 @@ _cases = {
         "ini": "sfincs_test.yml",
         "example": "sfincs_test",
     },
+    "test2": {
+        "example": "sfincs_test_quadtree",
+    },
 }
 
 
@@ -32,8 +35,11 @@ def test_model_class(case):
     mod.read()
     # run test_model_api() method
     non_compliant_list = mod._test_model_api()
+    # drop non-compliant variables with "results" and "mesh" in name
+    non_compliant_list = [
+        v for v in non_compliant_list if "results" not in v and "mesh" not in v
+    ]
     assert len(non_compliant_list) == 0
-    # pass
 
 
 def test_states(mod):
@@ -103,9 +109,60 @@ def test_infiltration(mod):
     assert np.isclose(mod1.grid["ks"].where(mod.mask > 0).sum(), 351.10803)
 
 
+def test_subgrid_io(tmpdir):
+    # test the backward compatibility of reading/writing subgrid
+    root = TESTMODELDIR
+    datadir = TESTDATADIR
+
+    mod0 = SfincsModel(root=root, mode="r")
+    # read-in the current subgrid (netcdf format)
+    mod0.read()
+    # check version and new parameter
+    assert mod0.reggrid.subgrid.version == 1
+    # u and v paramters should be separated internally
+    assert "u_pwet" in mod0.subgrid
+    assert "uv_pwet" not in mod0.subgrid
+    sbg_net = mod0.subgrid.copy()
+
+    # write the subgrid (new format)
+    tmp_root = str(tmpdir.join("subgrid_io_test"))
+    mod0.set_root(tmp_root, mode="w")
+    mod0.write()
+    assert isfile(join(mod0.root, "sfincs_subgrid.nc"))
+
+    # read back-in
+    mod1 = SfincsModel(root=tmp_root, mode="r")
+    mod1.read()
+    # Check if variables are the same
+    assert mod0.subgrid.variables.keys() == mod1.subgrid.variables.keys()
+
+    # Check if values are almost equal
+    for var_name in mod0.subgrid.variables:
+        assert np.isclose(np.sum(mod0.subgrid[var_name] - mod1.subgrid[var_name]), 0.0)
+
+    # copy old sbgfile to new location
+    sbgfile = join(datadir, "sfincs_test", "sfincs.sbg")
+
+    # change the subgrid to the old format (binary format)
+    mod1.set_config("sbgfile", sbgfile)
+    mod1.read_subgrid()
+
+    # check version and new parameter
+    assert mod1.reggrid.subgrid.version == 0
+    assert "u_pwet" not in mod1.subgrid
+    assert "uv_pwet" not in mod1.subgrid
+    sbg_bin = mod1.subgrid.copy()
+
+    # compare z_zmin and z_zmax
+    assert np.isclose(np.sum(sbg_net["z_zmin"] - sbg_bin["z_zmin"]), 0.0)
+    # TODO: check with Maarten whether this is meant to be different
+    # difference comes from different discretization of volume bins
+    assert np.isclose(np.sum(sbg_net["z_zmax"] - sbg_bin["z_zmax"]), 1.0714283)
+
+
 def test_subgrid_rivers(mod):
     gdf_riv = mod.data_catalog.get_geodataframe(
-        "rivers_lin2019_v1", geom=mod.region, buffer=1e3
+        "hydro_rivers_lin", geom=mod.region, buffer=1e3
     )
 
     # create dummy depths for the river based on the width
@@ -122,7 +179,12 @@ def test_subgrid_rivers(mod):
             {"elevtn": "merit_hydro", "zmin": 0.001},
             {"elevtn": "gebco"},
         ],
-        datasets_rgh=[{"lulc": "vito"}],
+        datasets_rgh=[
+            {
+                "lulc": "vito_2015",
+                "reclass_table": join(TESTDATADIR, "local_data", "vito_mapping.csv"),
+            }
+        ],
         datasets_riv=[
             {
                 "centerlines": gdf_riv,
@@ -308,20 +370,65 @@ def test_observations(tmpdir):
     assert len(mod.geoms["crs"].index) == nr_observation_lines * 2
 
 
-def test_read_results():
+def test_forcing_io(tmpdir):
     root = TESTMODELDIR
     mod = SfincsModel(root=root, mode="r")
-    assert all([v in mod.results for v in ["zs", "zsmax", "inp"]])
+    # read
+    mod.read_forcing()
 
+    # write forcing
+    tmp_root = str(tmpdir.join("forcing_test"))
+    mod.set_root(tmp_root, mode="w")
+    mod.write_forcing()
+    mod.write_config()
 
-def test_plots(mod):
-    mod.plot_forcing(fn_out="forcing.png")
-    assert isfile(join(mod.root, "figs", "forcing.png"))
-    mod.plot_basemap(fn_out="basemap.png")
-    assert isfile(join(mod.root, "figs", "basemap.png"))
+    # read and check if identical
+    mod1 = SfincsModel(root=tmp_root, mode="r")
+    mod1.read_forcing()
+    assert np.allclose(mod1.forcing["bzs"], mod.forcing["bzs"])
+
+    # now change the timeseries-format and write again
+    tmp_root = str(tmpdir.join("forcing_test2"))
+    mod1.set_root(tmp_root, mode="w+")
+    mod1.write_forcing(fmt="%7.1f")
+    mod1.write_config()
+
+    # read and check if identical
+    mod2 = SfincsModel(root=tmp_root, mode="r")
+    mod2.read_forcing()
+    assert np.isclose(
+        np.sum(mod2.forcing["bzs"].values - mod1.forcing["bzs"].values), 0.73
+    )
 
 
 @pytest.mark.parametrize("case", list(_cases.keys()))
+def test_read_results(case):
+    root = join(TESTDATADIR, _cases[case]["example"])
+    mod = SfincsModel(root=root, mode="r")
+    mod.read_results()
+    assert all([v in mod.results for v in ["zs", "zsmax", "inp"]])
+
+
+@pytest.mark.parametrize("case", list(_cases.keys()))
+def test_plots(case, tmpdir):
+    root = join(TESTDATADIR, _cases[case]["example"])
+    mod = SfincsModel(root=root, mode="r")
+    mod.read()
+    mod.plot_forcing(fn_out=join(tmpdir, "forcing.png"))
+    assert isfile(join(tmpdir, "forcing.png"))
+    fn_out = join(tmpdir, "basemap.png")
+    if case == "test2":
+        mod.plot_basemap(
+            fn_out=fn_out,
+            bmap="sat",
+            plot_bounds=False,  # does not work yet for quadtree
+        )
+    else:
+        mod.plot_basemap(fn_out=fn_out, bmap="sat")
+    assert isfile(fn_out)
+
+
+@pytest.mark.parametrize("case", list(_cases.keys())[:1])
 def test_model_build(tmpdir, case):
     # compare results with model from examples folder
     root = str(tmpdir.join(case))

@@ -23,7 +23,7 @@ class SfincsInput:
         self.tref = datetime(2010, 2, 1, 0, 0, 0)
         self.tstart = datetime(2010, 2, 1, 0, 0, 0)
         self.tstop = datetime(2010, 2, 2, 0, 0, 0)
-        self.tspinup = 60.0
+        self.tspinup = 0.0
         self.t0out = None
         self.dtout = 3600.0
         self.dtmapout = None
@@ -45,7 +45,7 @@ class SfincsInput:
         self.rhow = 1024.0
         self.dtmax = 60.0
         self.advection = 1
-        self.baro = 0
+        self.baro = 1
         self.pavbnd = 0
         self.gapres = 101200.0
         self.stopdepth = 100.0

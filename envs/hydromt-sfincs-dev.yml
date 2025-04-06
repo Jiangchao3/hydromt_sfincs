@@ -6,10 +6,11 @@ channels:
 dependencies:
 - affine
 - cartopy
+- datashader
 - descartes
 - ffmpeg
-- geopandas>=0.8
-- hydromt>=0.9.1, <0.10
+- geopandas>1.0
+- hydromt>=0.10, <0.11
 - jupyterlab
 - matplotlib
 - nbsphinx
@@ -30,6 +31,7 @@ dependencies:
 - shapely
 - sphinx
 - xarray
+- xugrid
 - pip:
   - black[jupyter]
   - sphinx_design
